@@ -1,0 +1,32 @@
+# Wayfare v2 — Netlify configuration
+#
+# There is no framework and no bundler. The "build" is one script that stamps
+# the deploy time into the HTML so the server can recognise stale clients.
+# Functions declare their own URLs via `export const config = { path }`.
+
+[build]
+  publish = "public"
+  command = "node stamp.mjs"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# The app must revalidate on every load. Someone with an older copy cached
+# would otherwise keep talking to a server that has moved on.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Robots-Tag = "noindex"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"

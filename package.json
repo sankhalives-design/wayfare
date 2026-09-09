@@ -1,0 +1,10 @@
+{
+  "name": "wayfare",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Wayfare - trip itinerary planner. Single-page app plus Netlify Functions.",
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0"
+  }
+}
