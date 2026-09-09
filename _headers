@@ -1,6 +1,0 @@
-# Netlify reads netlify.toml for headers on this project.
-# This file is kept only so it cannot contradict it.
-/*
-  X-Robots-Tag: noindex
-/index.html
-  Cache-Control: no-cache
