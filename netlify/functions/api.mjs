@@ -69,9 +69,10 @@ const GOOGLE = 'https://generativelanguage.googleapis.com';
    call. The ceiling belongs here, where it cannot be edited. */
 const MAX_OUTPUT_TOKENS = 16384;
 
-/* Plan generations per trip per day. Generous enough that nobody notices, but
-   it exists so the number is ours to choose rather than a surprise later. */
-const DAILY_CAP = Number(process.env.WAYFARE_DAILY_CAP || 60);
+/* Plan generations per trip per day. Counted per REQUEST, and one trip is now
+   an outline plus a request per day — so a ten-day trip costs eleven. Set high
+   enough that a family regenerating freely never notices it. */
+const DAILY_CAP = Number(process.env.WAYFARE_DAILY_CAP || 300);
 
 const MAX_BYTES = 3 * 1024 * 1024;
 const TOKEN_RE = /^[A-Za-z0-9_-]{16,64}$/;
@@ -266,6 +267,65 @@ async function testKey() {
   }
 }
 
+/* Two probes, deliberately different. The first is the smallest legal request
+   Google documents. The second is the request Wayfare actually sends, with the
+   system instruction, the JSON response type and the token ceiling. If the
+   first passes and the second fails, the fault is in what we ask for, and the
+   difference between them names it. */
+async function testGenerate(key, model, appStyle) {
+  const target = GOOGLE + '/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
+  const body = appStyle
+    ? {
+        contents: [{ role: 'user', parts: [{ text: 'Return {"ok":true} and nothing else.' }] }],
+        systemInstruction: { parts: [{ text: 'You reply only with a single JSON object.' }] },
+        generationConfig: { responseMimeType: 'application/json', maxOutputTokens: MAX_OUTPUT_TOKENS }
+      }
+    : { contents: [{ parts: [{ text: 'Say OK.' }] }] };
+
+  try {
+    const r = await fetch(target, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    if (r.ok) return { style: appStyle ? 'as Wayfare sends it' : 'bare minimum', model, status: r.status, ok: true };
+    console.error('[wayfare] generate probe failed', r.status, text.slice(0, 800));
+    return {
+      style: appStyle ? 'as Wayfare sends it' : 'bare minimum',
+      model, status: r.status, ok: false,
+      googleSaid: text.slice(0, 800),
+      verdict: explainGoogleError(r.status, text) || null
+    };
+  } catch (err) {
+    return { style: appStyle ? 'as Wayfare sends it' : 'bare minimum', model, ok: false,
+             googleSaid: 'Could not reach Google: ' + String(err && err.message) };
+  }
+}
+
+/* Whatever Google currently offers that can generate text, newest Flash first —
+   so the probe never fails merely because a model name went out of date. */
+async function bestModel(key) {
+  try {
+    const r = await fetch(GOOGLE + '/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const usable = (j.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map(m => String(m.name || '').replace(/^models\//, ''))
+      .filter(id => id && !/embedding|aqa|imagen|veo|tts|audio|image|learnlm/i.test(id))
+      .sort((a, b) => {
+        const score = (id) => {
+          const v = parseFloat((id.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || '0');
+          return v * 20 + (/flash/.test(id) ? 100 : 0) + (/pro/.test(id) ? 60 : 0)
+                 - (/lite/.test(id) ? 35 : 0) - (/preview|exp|thinking/.test(id) ? 25 : 0);
+        };
+        return score(b) - score(a);
+      });
+    return usable[0] || null;
+  } catch (err) { return null; }
+}
+
 async function health(url) {
   /* Actually exercise storage rather than just loading the module. A store
      that constructs fine but fails on first read is the failure mode worth
@@ -284,12 +344,41 @@ async function health(url) {
      app makes on every load stays instant and makes no outbound calls. */
   const keyTest = (url && url.searchParams.get('test')) ? await testKey() : undefined;
 
+  /* When the key is good but the app still cannot generate, the useful question
+     is no longer "is the key valid" but "which part of the request is refused".
+     Only runs when asked for, and only when the key already passed. */
+  let generateTests;
+  if (keyTest && keyTest.ok) {
+    const key = (process.env.GEMINI_API_KEY || '').trim();
+    const model = (url && url.searchParams.get('model')) || await bestModel(key) || 'gemini-3.8-flash';
+    generateTests = [
+      await testGenerate(key, model, false),
+      await testGenerate(key, model, true)
+    ];
+    const bare = generateTests[0], full = generateTests[1];
+    if (bare.ok && !full.ok) {
+      generateTests.push({ conclusion:
+        'The key and the model are fine. Google refuses the request only when Wayfare adds its own ' +
+        'settings — the system instruction, the JSON response type, or the ' + MAX_OUTPUT_TOKENS +
+        ' token ceiling. The "googleSaid" text above says which.' });
+    } else if (!bare.ok) {
+      generateTests.push({ conclusion:
+        'Even the simplest possible request is refused, so this is not about how Wayfare asks. ' +
+        'Read "googleSaid" above — it is Google\'s own words.' });
+    } else {
+      generateTests.push({ conclusion:
+        'Both requests worked. Generation is healthy from the server, so if the app still fails, ' +
+        'the app is sending something different — most likely a stale model saved in Settings.' });
+    }
+  }
+
   const durable = storage === 'blobs';
   return json(200, {
     wayfare: true,
     version: '2.0',
     hasServerKey: !!(process.env.GEMINI_API_KEY || '').trim(),
     keyTest,
+    generateTests,
     sharing: durable,
     collaboration: durable,
     storage,
