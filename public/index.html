@@ -581,7 +581,7 @@ const Repo = {
   },
   async getSettings(){ return Object.assign({
       units:'metric', weekStart:0,
-      apiKey:'', model:'', proxyBase:'', maxTokens:32768, models:[],
+      apiKey:'', model:'', proxyBase:'', maxTokens:12288, models:[],
       depth:{places:true, food:false, transport:false, tips:true}
     }, this._read(LS_SETTINGS, {})); },
   async setSettings(s){ this._write(LS_SETTINGS, s); }
@@ -3557,7 +3557,11 @@ const AI = {
     if(m.startsWith('STALE_BUILD')) return m.replace(/^STALE_BUILD:\s*/,'') + ' (Pull down to refresh, or close the tab and reopen the link.)';
     if(m.startsWith('DAILY_CAP')) return m.replace(/^DAILY_CAP:\s*/,'');
     if(m.startsWith('NO_SERVER_KEY')) return m.replace(/^NO_SERVER_KEY:\s*/,'');
-    if(m==='TRUNCATED') return 'The plan was cut off before it finished. Raise "max output tokens" in Settings, or regenerate one day at a time.';
+    /* The app already retries a truncated day with the ceiling raised, so by
+       the time this is shown the roomiest request has also come up short.
+       Sending someone to a settings field that is already at its maximum is
+       worse than useless. */
+    if(m==='TRUNCATED') return 'Gemini ran out of room before finishing this day, even on a second try with the ceiling raised. Usually it is trying to cram too much in: open Settings and turn off one of the detail options (transport notes or local tips), or regenerate this one day with a shorter instruction.';
     if(m.startsWith('BLOCKED')) return 'Gemini blocked the request (' + m.replace('BLOCKED: ','') + '). Reword the notes or constraints and retry.';
     if(m.startsWith('EMPTY')) return 'Gemini returned nothing usable. Retry, or pick a different model in Settings. (' + m + ')';
     if(m.startsWith('HTTP_401')) return 'No API key reached the server. Paste one into Settings, or restart the server with GEMINI_API_KEY=... set.';
@@ -3736,11 +3740,19 @@ async function generateTripInChunks({trip, nudge, ui}){
   const cancelled = ()=> _genAbort && _genAbort.signal.aborted;
   const stop = ()=>{ const e = new Error('Cancelled'); e.name = 'AbortError'; return e; };
 
+  /* The server clamps at 16384, so that is the real ceiling whatever Settings
+     says. The outline is one short line per date, so it is sized by trip
+     length rather than by a fixed guess that a three-week trip would overrun. */
+  const CEILING = 16384;
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+  const wantedDays = D.range(trip.flights.outDate, trip.flights.backDate||trip.flights.outDate).length;
+  const dayBudget = clamp(Number(App.settings.maxTokens) || 12288, 4096, CEILING);
+
   say('Sketching the shape of the trip…');
   note('outline');
   const outline = await AI.call({
     prompt: AI.outlinePrompt(trip, nudge),
-    maxTokens: 2048,
+    maxTokens: clamp(wantedDays * 220, 2048, 8192),
     signal: _genAbort.signal,
     onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
   });
@@ -3761,15 +3773,28 @@ async function generateTripInChunks({trip, nudge, ui}){
       o.area  ? 'Base this day around: ' + o.area : ''
     ].filter(Boolean).join('\n');
 
+    /* A day that runs over its budget comes back as unparseable half-JSON.
+       Rather than hand that to the person as a setting to go and tune, give it
+       one more go with the ceiling raised. */
+    const askForDay = async (budget) => AI.call({
+      prompt: AI.dayPrompt(trip, day, [nudge, guide].filter(Boolean).join('\n')),
+      maxTokens: budget,
+      signal: _genAbort.signal,
+      onModel: (model, switched)=>{ if(switched) say('Day ' + (i+1) + ' of ' + days.length +
+        ' — first choice was busy, using ' + model); },
+      onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
+    });
+
     try{
-      const text = await AI.call({
-        prompt: AI.dayPrompt(trip, day, [nudge, guide].filter(Boolean).join('\n')),
-        maxTokens: 8192,
-        signal: _genAbort.signal,
-        onModel: (model, switched)=>{ if(switched) say('Day ' + (i+1) + ' of ' + days.length +
-          ' — first choice was busy, using ' + model); },
-        onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
-      });
+      let text;
+      try{
+        text = await askForDay(dayBudget);
+      }catch(err){
+        if(err.name === 'AbortError') throw err;
+        if(!/TRUNCATED/.test(err.message||'') || dayBudget >= CEILING) throw err;
+        say('Day ' + (i+1) + ' of ' + days.length + ' — that ran long, asking again with more room');
+        text = await askForDay(CEILING);
+      }
       AI.applyDayPlan(trip, day, AI.extractJSON(text));
       /* Saved as we go, so a failure halfway keeps everything before it.
          Not for an unsaved draft, which should not appear in the trip list
@@ -4143,8 +4168,10 @@ function openSettingsModal(){
             ? s.models.length+' models available to your key'
             : 'Press ↻ to load the live list from Google.'}</div></div>
         <div class="field"><label>Max output tokens</label>
-          <input type="number" id="s-maxTokens" value="${attr(s.maxTokens||32768)}" min="2000" max="200000" step="1000">
-          <div class="hint">Raise if long trips get cut off mid-plan.</div></div>
+          <input type="number" id="s-maxTokens" value="${attr(s.maxTokens||12288)}" min="4096" max="16384" step="1024">
+          <div class="hint">How much room one day gets. 16384 is the ceiling the server allows,
+            and the app raises a day to it automatically if the first attempt runs long,
+            so there is rarely any reason to change this.</div></div>
       </div>
 
       <div class="field"><label>Server address</label>
