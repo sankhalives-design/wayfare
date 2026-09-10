@@ -14,7 +14,47 @@
    which you set in Netlify and which never reaches anyone's browser.
    ========================================================================== */
 
-import { getStore } from '@netlify/blobs';
+/* Storage is loaded lazily and defensively. If @netlify/blobs is missing or
+   fails to load for any reason, the site still deploys and Gemini still
+   works — only sharing degrades, and /wayfare-health says so. A cosmetic
+   dependency problem should never take the whole site down. */
+let _getStore;
+const _mem = new Map();
+
+function memoryStore(name) {
+  if (!_mem.has(name)) _mem.set(name, new Map());
+  const m = _mem.get(name);
+  return {
+    async get(key, opts) {
+      const v = m.get(key);
+      if (v === undefined) return null;
+      return (opts && opts.type === 'json') ? JSON.parse(v) : v;
+    },
+    async setJSON(key, val) { m.set(key, JSON.stringify(val)); },
+    async set(key, val) { m.set(key, val); }
+  };
+}
+
+async function getStoreSafe(name) {
+  if (_getStore === undefined) {
+    try {
+      const mod = await import('@netlify/blobs');
+      _getStore = mod.getStore;
+    } catch (err) {
+      console.warn('[wayfare] @netlify/blobs unavailable, using memory store:', err && err.message);
+      _getStore = null;
+    }
+  }
+  if (!_getStore) return memoryStore(name);
+  try {
+    return _getStore({ name, consistency: 'strong' });
+  } catch (err) {
+    console.warn('[wayfare] getStore failed, using memory store:', err && err.message);
+    return memoryStore(name);
+  }
+}
+
+const storageKind = () => (_getStore === undefined ? 'unknown' : _getStore ? 'blobs' : 'memory');
 
 /* -------------------------------------------------------------- settings -- */
 
@@ -51,7 +91,7 @@ const json = (status, body, extra = {}) =>
     headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...CORS, ...extra }
   });
 
-const store = () => getStore({ name: 'wayfare-trips', consistency: 'strong' });
+const store = () => getStoreSafe('wayfare-trips');
 
 const now = () => new Date().toISOString();
 
@@ -90,7 +130,7 @@ function newToken() {
 async function bumpQuota(subject) {
   const day = new Date().toISOString().slice(0, 10);
   const key = `quota/${day}/${subject}`;
-  const s = getStore({ name: 'wayfare-meta', consistency: 'strong' });
+  const s = await getStoreSafe('wayfare-meta');
   let count = 0;
   try {
     const prev = await s.get(key, { type: 'json' });
@@ -127,15 +167,106 @@ const K = {
 
 /* ============================================================ health ===== */
 
-function health() {
+/* Google's key errors all surface to a person as "it rejected my key", but the
+   causes are unrelated and the fixes have nothing in common. This turns the
+   raw refusal into the one sentence that says what to go and change. */
+function explainGoogleError(status, text) {
+  const t = String(text || '');
+  const low = t.toLowerCase();
+
+  if (low.includes('referer') || low.includes('referrer')) {
+    return 'Your Google key is restricted to specific websites. That restriction cannot work here, ' +
+           'because the call to Google is made by this site\'s server rather than by a browser, and a ' +
+           'server sends no website name. Fix: at aistudio.google.com/apikey open the key, and under ' +
+           'Application restrictions choose "None". Leave the API restriction alone.';
+  }
+  if (low.includes('api key not valid') || low.includes('api_key_invalid') || low.includes('invalid api key')) {
+    return 'Google does not recognise this key. Usually one of three things: the key was deleted or ' +
+           'regenerated after you pasted it; quotation marks or a stray space were pasted along with it; ' +
+           'or it was pasted into the Key box instead of the Value box in Netlify. The Key box must say ' +
+           'GEMINI_API_KEY and nothing else, and the Value box holds the AIza... string on its own.';
+  }
+  if (low.includes('service_disabled') || low.includes('has not been used in project') ||
+      low.includes('is disabled')) {
+    return 'The key is real, but the Generative Language API is switched off for the Google project it ' +
+           'belongs to. Easiest fix: at aistudio.google.com/apikey create a new key and let Google make a ' +
+           'new project for it, then put that key into Netlify instead.';
+  }
+  if (low.includes('api_key_service_blocked') || low.includes('blocked')) {
+    return 'This key is restricted to a list of Google APIs that does not include the Generative Language ' +
+           'API. At aistudio.google.com/apikey open the key and either allow "Generative Language API" or ' +
+           'remove the API restriction.';
+  }
+  if (status === 429 || low.includes('resource_exhausted') || low.includes('quota')) {
+    return 'The key is fine, but Google\'s free allowance for today is used up. It resets on its own. ' +
+           'You can still edit days by hand in the meantime.';
+  }
+  if (status === 403) {
+    return 'Google refused the key (403). Check at aistudio.google.com/apikey that the key still exists ' +
+           'and that its Application restrictions are set to "None".';
+  }
+  return null;
+}
+
+/* Asks Google, with the key this site actually holds, whether it works.
+   Deliberately never returns the key or any part of it. */
+async function testKey() {
+  const raw = process.env.GEMINI_API_KEY || '';
+  const key = raw.trim();
+  const shape = {
+    present: !!key,
+    length: key.length,
+    looksLikeAGoogleKey: /^AIza[A-Za-z0-9_-]{30,}$/.test(key),
+    hasQuotesAround: /^["']|["']$/.test(key),
+    hadStraySpaces: raw !== key
+  };
+  if (!key) return { ok: false, shape, verdict: 'No GEMINI_API_KEY is set on this site.' };
+
+  try {
+    const r = await fetch(GOOGLE + '/v1beta/models?pageSize=1', { headers: { 'x-goog-api-key': key } });
+    const text = await r.text();
+    if (r.ok) return { ok: true, shape, verdict: 'Google accepted this key.' };
+    return {
+      ok: false, shape, googleStatus: r.status,
+      googleSaid: text.slice(0, 500),
+      verdict: explainGoogleError(r.status, text) || 'Google refused the key and did not say why.'
+    };
+  } catch (err) {
+    return { ok: false, shape, verdict: 'Could not reach Google at all: ' + String(err && err.message) };
+  }
+}
+
+async function health(url) {
+  /* Actually exercise storage rather than just loading the module. A store
+     that constructs fine but fails on first read is the failure mode worth
+     catching, and this is the page a person will be told to open. */
+  let storage = 'unknown', storageError = null;
+  try {
+    const s = await getStoreSafe('wayfare-meta');
+    await s.get('__healthprobe');
+    storage = storageKind();
+  } catch (err) {
+    storage = 'error';
+    storageError = String((err && err.message) || err).slice(0, 300);
+  }
+  /* /wayfare-health?test=1 goes further and actually tries the key against
+     Google. Kept behind the parameter so the ordinary health check that the
+     app makes on every load stays instant and makes no outbound calls. */
+  const keyTest = (url && url.searchParams.get('test')) ? await testKey() : undefined;
+
+  const durable = storage === 'blobs';
   return json(200, {
     wayfare: true,
     version: '2.0',
     hasServerKey: !!(process.env.GEMINI_API_KEY || '').trim(),
-    sharing: true,
-    collaboration: true,
+    keyTest,
+    sharing: durable,
+    collaboration: durable,
+    storage,
+    storageError,
     minClientBuild: MIN_CLIENT_BUILD,
     dailyGenerationCap: DAILY_CAP,
+    nodeVersion: (typeof process !== 'undefined' && process.version) || 'unknown',
     appPresent: true
   });
 }
@@ -171,7 +302,16 @@ async function gemini(req, url) {
 
   if (isModelList) {
     const r = await fetch(target, { headers: { 'x-goog-api-key': key } });
-    return new Response(await r.text(), {
+    const text = await r.text();
+    if (!r.ok) {
+      const why = explainGoogleError(r.status, text);
+      return json(r.status, { error: {
+        code: r.status, status: 'GOOGLE_REFUSED',
+        message: why || ('Google refused the key (' + r.status + ').'),
+        googleSaid: text.slice(0, 500)
+      }});
+    }
+    return new Response(text, {
       status: r.status,
       headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...CORS }
     });
@@ -202,6 +342,19 @@ async function gemini(req, url) {
     headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify(body)
   });
+
+  /* A refusal is never a stream — it is a small JSON error. Buffer it and say
+     what it means, otherwise the app shows Google's wording, which describes
+     the symptom and never the fix. */
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    const why = explainGoogleError(upstream.status, text);
+    return json(upstream.status, { error: {
+      code: upstream.status, status: 'GOOGLE_REFUSED',
+      message: why || ('Google refused this request (' + upstream.status + ').'),
+      googleSaid: text.slice(0, 500)
+    }});
+  }
 
   /* Streamed straight through, so the progress bar in the app stays live. */
   return new Response(upstream.body, {
@@ -241,7 +394,7 @@ async function trips(req, url) {
   const id = parts[0] || '';
   const device = deviceOf(req);
   const who = whoOf(req);
-  const s = store();
+  const s = await store();
 
   /* ---------------------------------------------------------- create ---- */
   if (req.method === 'POST' && !id) {
@@ -422,7 +575,7 @@ export default async (req) => {
   const p = url.pathname;
 
   try {
-    if (p === '/wayfare-health') return health();
+    if (p === '/wayfare-health') return await health(url);
     if (p.startsWith('/gapi/'))  return await gemini(req, url);
     if (p.startsWith('/api/trip')) return await trips(req, url);
   } catch (err) {
