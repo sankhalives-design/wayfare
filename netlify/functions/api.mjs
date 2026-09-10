@@ -181,10 +181,11 @@ function explainGoogleError(status, text) {
            'Application restrictions choose "None". Leave the API restriction alone.';
   }
   if (low.includes('api key not valid') || low.includes('api_key_invalid') || low.includes('invalid api key')) {
-    return 'Google does not recognise this key. Usually one of three things: the key was deleted or ' +
-           'regenerated after you pasted it; quotation marks or a stray space were pasted along with it; ' +
-           'or it was pasted into the Key box instead of the Value box in Netlify. The Key box must say ' +
-           'GEMINI_API_KEY and nothing else, and the Value box holds the AIza... string on its own.';
+    return 'Google does not recognise this key. The most common cause in 2026 is an old-style "AIza" key: ' +
+           'Google retired those in September 2026, and a retired key gives exactly this message. Make a ' +
+           'new key at aistudio.google.com/apikey — new ones begin "AQ." and are several hundred ' +
+           'characters long, which is normal. Otherwise: the key was deleted or regenerated after you ' +
+           'pasted it, it was copied only in part, or something other than the key went into the Value box.';
   }
   if (low.includes('service_disabled') || low.includes('has not been used in project') ||
       low.includes('is disabled')) {
@@ -213,19 +214,48 @@ function explainGoogleError(status, text) {
 async function testKey() {
   const raw = process.env.GEMINI_API_KEY || '';
   const key = raw.trim();
+  /* Google has two key formats in circulation. "AIza..." standard keys are the
+     old ones and are being switched off during 2026; "AQ." auth keys are what
+     AI Studio issues now, and they are long because they carry a service
+     account identity inside them. Both are sent the same way. */
+  const isStandard = /^AIza[A-Za-z0-9_-]{30,}$/.test(key);
+  const isAuth     = /^AQ\./.test(key);
+  const buried     = !isStandard && !isAuth && /AIza[A-Za-z0-9_-]{30,}/.test(key);
+
   const shape = {
     present: !!key,
     length: key.length,
-    looksLikeAGoogleKey: /^AIza[A-Za-z0-9_-]{30,}$/.test(key),
+    keyType: isAuth ? 'auth (AQ.)' : isStandard ? 'standard (AIza) — being retired by Google' : 'unrecognised',
+    /* Enough to name the mistake, nowhere near enough to use. */
+    startsWith: key.slice(0, 3),
     hasQuotesAround: /^["']|["']$/.test(key),
-    hadStraySpaces: raw !== key
+    hadStraySpaces: raw !== key,
+    hasLineBreaks: /[\r\n]/.test(key),
+    keyIsBuriedInOtherText: buried
   };
   if (!key) return { ok: false, shape, verdict: 'No GEMINI_API_KEY is set on this site.' };
+
+  if (buried) {
+    return { ok: false, shape, verdict:
+      'The value in Netlify contains a key with other text wrapped around it — which is what ' +
+      'happens when you copy a code example instead of the key itself. Open the value, find the ' +
+      'run of characters that is the key, and make that the entire value, with nothing else.' };
+  }
 
   try {
     const r = await fetch(GOOGLE + '/v1beta/models?pageSize=1', { headers: { 'x-goog-api-key': key } });
     const text = await r.text();
     if (r.ok) return { ok: true, shape, verdict: 'Google accepted this key.' };
+
+    /* Google says "API key not valid" for a retired standard key too, which
+       sends people hunting for a typo that is not there. */
+    if (isStandard && /api.key.not.valid|API_KEY_INVALID/i.test(text)) {
+      return { ok: false, shape, googleStatus: r.status, googleSaid: text.slice(0, 500), verdict:
+        'This is an old-style "AIza" key, and Google stopped accepting those in September 2026. ' +
+        'Nothing is wrong with how you pasted it — it simply no longer works. Go to ' +
+        'aistudio.google.com/apikey, click Create API key, and use the new key you get. ' +
+        'The new ones begin "AQ." and are much longer; that is expected.' };
+    }
     return {
       ok: false, shape, googleStatus: r.status,
       googleSaid: text.slice(0, 500),
