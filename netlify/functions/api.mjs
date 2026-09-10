@@ -200,8 +200,13 @@ function explainGoogleError(status, text) {
            'remove the API restriction.';
   }
   if (status === 429 || low.includes('resource_exhausted') || low.includes('quota')) {
-    return 'The key is fine, but Google\'s free allowance for today is used up. It resets on its own. ' +
-           'You can still edit days by hand in the meantime.';
+    /* Google uses 429 for both "too fast this minute" and "done for the day",
+       and the two feel completely different to wait out. Do not claim to know
+       which one it is. */
+    return 'The key is fine — Google is limiting how many requests it will take. This is usually the ' +
+           'per-minute limit rather than the daily one, so waiting a minute normally clears it. ' +
+           'If it persists all day, the daily free allowance is spent and resets overnight. ' +
+           'Anything already planned is kept, and you can edit days by hand meanwhile.';
   }
   if (status === 403) {
     return 'Google refused the key (403). Check at aistudio.google.com/apikey that the key still exists ' +
