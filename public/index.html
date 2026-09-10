@@ -3030,9 +3030,10 @@ const AI = {
   directOK: null,             // true once a straight browser->Google call works
   directNote: '',
   transport: 'none',          // direct | proxy | none
-  /* Only a fallback for when the model list cannot be fetched — normally the
-     app asks Google what exists and picks the newest Flash itself. */
-  DEFAULT_MODEL: 'gemini-3.8-flash',
+  /* Only a fallback for when the model list cannot be fetched. Deliberately a
+     Flash one step back from the newest: verified answering on the free tier
+     while the newest was returning "high demand". */
+  DEFAULT_MODEL: 'gemini-3.6-flash',
   PORTS: ['8000','8001','8002','8080','8888','5000','3000'],
 
   /* Google DOES allow browser calls (its own JS SDK runs client-side), so try
@@ -3385,7 +3386,11 @@ const AI = {
     if(/lite/.test(id))  s -= 35;
     if(/preview|exp|thinking/.test(id)) s -= 25;
     if(/\d{2}-\d{2}$/.test(id)) s -= 8;            // dated snapshots below the alias
-    if(/latest/.test(id)) s += 4;
+    /* "-latest" aliases resolve to whatever model is newest, and newest is
+       exactly what everyone else on the free tier is also hammering. Measured:
+       gemini-flash-latest was rate-limited while a fixed older Flash answered
+       the same request straight away. So the alias goes down the list, not up. */
+    if(/latest/.test(id)) s -= 12;
     return s;
   },
 
@@ -3394,11 +3399,82 @@ const AI = {
     return list[0].id;
   },
 
+  /* ------------------------ models that are misbehaving ------------------- */
+  /* Free-tier Gemini sheds load on whichever model is currently fashionable.
+     Measured on a live site: the newest Flash returned 503 "high demand" while
+     models one or two versions back answered the identical request instantly.
+     So "newest" is the worst default, and the app must be able to step aside
+     rather than fail. These two sets last for the session only — a model that
+     is busy this afternoon is usually fine tomorrow. */
+  _busy: new Set(),
+  _dead: new Set(),
+
+  /* The model to try first, then the rest, best-scoring first. */
+  modelCandidates(){
+    const chosen = (App.settings.model||'').trim();
+    const all = (App.settings.models||[]).map(m=>m.id).filter(Boolean);
+    const ranked = all.slice().sort((a,b)=>this.modelScore(b)-this.modelScore(a));
+    const list = [];
+    if(chosen) list.push(chosen);
+    ranked.forEach(id=>{ if(!list.includes(id)) list.push(id); });
+    if(!list.includes(this.DEFAULT_MODEL)) list.push(this.DEFAULT_MODEL);
+    const usable = list.filter(id => !this._dead.has(id) && !this._busy.has(id));
+    /* If everything is marked busy, the marks are stale — try again anyway. */
+    return usable.length ? usable : list.filter(id => !this._dead.has(id));
+  },
+
+  pause(ms){ return new Promise(r=>setTimeout(r, ms)); },
+
   /* --------------------------- streaming call ---------------------------- */
-  async call({prompt, maxTokens, onDelta, signal}){
+  /* Tries a model, gives it one second chance, then moves to the next one.
+     A model that is overloaded is remembered, so the remaining days of a trip
+     go straight to one that works instead of stalling on each. */
+  async call({prompt, maxTokens, onDelta, signal, onModel}){
     if(this.transport==='none') throw new Error('NO_TRANSPORT');
     if(!this.keyForTransport()) throw new Error('NO_KEY');
-    const model = (App.settings.model||'').trim() || this.DEFAULT_MODEL;
+
+    const candidates = this.modelCandidates();
+    let lastErr = null;
+
+    for(let i = 0; i < candidates.length && i < 5; i++){
+      const model = candidates[i];
+      for(let attempt = 0; attempt < 2; attempt++){
+        try{
+          if(onModel) onModel(model, i > 0);
+          return await this.callOnce({model, prompt, maxTokens, onDelta, signal});
+        }catch(err){
+          if(err.name === 'AbortError') throw err;
+          lastErr = err;
+          /* The status code is the reliable signal, but the server rewrites
+             Google's refusals into plain English before they get here, so the
+             wording is checked too — a message that survives a rewrite must
+             not be the only thing standing between a busy model and a retry. */
+          const msg = err.message || '';
+          /* Wayfare's own refusals are final. Trying a different model would
+             not help, and would burn four more requests finding that out. */
+          if(/^(DAILY_CAP|STALE_BUILD|NO_SERVER_KEY|NO_KEY|NO_TRANSPORT)/.test(msg)) throw err;
+          const s = err.status || Number((msg.match(/HTTP_(\d{3})/)||[])[1]) ||
+                                 Number((msg.match(/\((\d{3})\)/)||[])[1]) || 0;
+          const busy = s===503 || s===429 || s===500 || s===502 || s===504 ||
+                       /UNAVAILABLE|high demand|overloaded|rate|too many requests|allowance|quota/i.test(msg);
+          const gone = s===404 || /is not found|not supported|does not exist/i.test(msg);
+
+          if(gone){ this._dead.add(model); break; }          // retired: never again
+          if(!busy) throw err;                               // a real fault: surface it
+
+          /* 503 means that model is swamped, and swamped does not clear in a
+             second — move to another one at once. 429 is our own rate, which
+             a short wait does fix, so that one is worth a second try. */
+          if(s === 503){ this._busy.add(model); break; }
+          if(attempt === 0){ await this.pause(s === 429 ? 2500 : 1500); continue; }
+          this._busy.add(model);                             // tried twice: step aside
+        }
+      }
+    }
+    throw lastErr || new Error('NO_TRANSPORT');
+  },
+
+  async callOnce({model, prompt, maxTokens, onDelta, signal}){
     const url = this.apiRoot() + '/v1beta/models/' + encodeURIComponent(model) +
                 ':streamGenerateContent?alt=sse';
     let res;
@@ -3425,15 +3501,18 @@ const AI = {
     if(!res.ok){
       let msg='', status='';
       try{ const j = await res.json(); msg = j?.error?.message||''; status = j?.error?.status||''; }catch(e){}
+      /* The HTTP code rides along on the error, because the caller decides
+         whether this is worth retrying and cannot tell from prose. */
+      const fail = (m) => { const e = new Error(m); e.status = res.status; e.gstatus = status; throw e; };
       /* Messages our own server writes are already written for a person —
          pass them through verbatim rather than wrapping them in jargon. */
-      if(res.status === 426) throw new Error('STALE_BUILD: ' + msg);
-      if(status === 'DAILY_CAP') throw new Error('DAILY_CAP: ' + msg);
-      if(status === 'NO_SERVER_KEY') throw new Error('NO_SERVER_KEY: ' + msg);
+      if(res.status === 426) fail('STALE_BUILD: ' + msg);
+      if(status === 'DAILY_CAP') fail('DAILY_CAP: ' + msg);
+      if(status === 'NO_SERVER_KEY') fail('NO_SERVER_KEY: ' + msg);
       /* The server has already worked out what Google's refusal means and
          written the fix in plain words. Show that, not the HTTP code. */
-      if(status === 'GOOGLE_REFUSED') throw new Error(msg || ('Google refused the request (' + res.status + ').'));
-      throw new Error('HTTP_'+res.status+(status?' '+status:'')+(msg?': '+msg:''));
+      if(status === 'GOOGLE_REFUSED') fail(msg || ('Google refused the request (' + res.status + ').'));
+      fail('HTTP_'+res.status+(status?' '+status:'')+(msg?': '+msg:''));
     }
 
     const reader = res.body.getReader(), dec = new TextDecoder();
@@ -3487,6 +3566,10 @@ const AI = {
     if(m.startsWith('HTTP_403')) return 'Access denied (403). The key may be restricted, or the Generative Language API is not enabled for that project.';
     if(m.startsWith('HTTP_404')) return 'That model name does not exist for your key. Hit "Refresh model list" in Settings and pick one from the dropdown.';
     if(m.startsWith('HTTP_429')) return 'Free-tier quota hit (requests per minute or per day). Wait a minute, switch to a Flash-Lite model, or try again tomorrow.';
+    /* Reached only after every candidate model was busy, so "try another
+       model" would be advice the app has already taken on your behalf. */
+    if(/503|UNAVAILABLE|high demand|overloaded/i.test(m))
+      return 'Gemini is overloaded right now. The app already tried the other models available to your key and they were all busy — this is Google being swamped, not a fault in your setup. Wait a few minutes and press Generate again; anything already planned has been kept.';
     /* A 500 from Wayfare's own function is not a Google outage, and saying so
        sends people off waiting for something that will never clear. Our
        function labels its own failures SERVER_ERROR; anything else at 5xx
@@ -3635,13 +3718,16 @@ const AI = {
 /* --------------------------- generation modal ---------------------------- */
 let _genAbort = null;
 
-/* Netlify stops a function at ten seconds. A whole itinerary in one request
-   routinely runs past that, and when it does the function is killed mid-reply
-   and the app sees a meaningless 5xx. So a trip is built in small pieces: one
-   quick outline, then one request per day. Every request finishes well inside
-   the limit, each day is saved as it lands, and one bad day no longer costs
-   you the whole plan. It also plans better — each day is written knowing what
-   the days around it already contain. */
+/* A trip is built in small pieces: one quick outline, then one request per day.
+   Measured against the live site: the outline takes about five seconds and a
+   day about fifteen. Asking for a whole fortnight in one request instead means
+   a single reply of many minutes, which is where platform limits, dropped
+   connections and truncated JSON all live.
+
+   Three things fall out of doing it this way. Each day is saved the moment it
+   lands, so a failure at day six keeps days one to five. A day that fails can
+   be retried on its own. And the plans are better, because each day is written
+   knowing what the days around it already contain. */
 async function generateTripInChunks({trip, nudge, ui}){
   const say  = (t)=>{ if(ui.status) ui.status.textContent = t; };
   const note = (t)=>{ if(ui.daysP)  ui.daysP.textContent  = t; };
@@ -3680,6 +3766,8 @@ async function generateTripInChunks({trip, nudge, ui}){
         prompt: AI.dayPrompt(trip, day, [nudge, guide].filter(Boolean).join('\n')),
         maxTokens: 8192,
         signal: _genAbort.signal,
+        onModel: (model, switched)=>{ if(switched) say('Day ' + (i+1) + ' of ' + days.length +
+          ' — first choice was busy, using ' + model); },
         onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
       });
       AI.applyDayPlan(trip, day, AI.extractJSON(text));
