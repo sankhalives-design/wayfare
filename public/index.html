@@ -18,7 +18,7 @@
 <script>
 /* ==========================================================================
    Wayfare v2 keeps NO API key in the browser. The key lives in a Netlify
-   environment variable and is used only inside netlify/functions/gapi.mjs.
+   environment variable and is used only inside netlify/functions/api.mjs.
    The v1 scrambled-key mechanism (window.WAYFARE_K and its XOR helper) has
    been removed outright rather than left disabled, so nobody is tempted to
    switch it back on. Build stamp is still injected here at deploy time.
@@ -3030,7 +3030,9 @@ const AI = {
   directOK: null,             // true once a straight browser->Google call works
   directNote: '',
   transport: 'none',          // direct | proxy | none
-  DEFAULT_MODEL: 'gemini-2.5-flash',
+  /* Only a fallback for when the model list cannot be fetched — normally the
+     app asks Google what exists and picks the newest Flash itself. */
+  DEFAULT_MODEL: 'gemini-3.8-flash',
   PORTS: ['8000','8001','8002','8080','8888','5000','3000'],
 
   /* Google DOES allow browser calls (its own JS SDK runs client-side), so try
@@ -3061,7 +3063,14 @@ const AI = {
      Rather than assume same-origin, try every plausible origin. The server
      sends Access-Control-Allow-Origin:* plus the private-network header, so
      even a file:// page can reach it. */
+  /* On the published site the server is, by construction, the same origin as
+     the page. Anything remembered from a local session (a localhost port from
+     testing, say) is not merely useless there — it is actively harmful,
+     because sync would quietly aim at a machine nobody else can reach. */
+  hosted(){ return location.protocol === 'https:'; },
+
   candidates(){
+    if(this.hosted()) return [''];
     const out = [];
     const cfg = String(App.settings.proxyBase||'').replace(/\/+$/,'');
     if(cfg) out.push(cfg);
@@ -3073,6 +3082,7 @@ const AI = {
   },
 
   serverBase(){
+    if(this.hosted()) return '';
     if(this.foundBase !== null) return this.foundBase;
     return String(App.settings.proxyBase||'').replace(/\/+$/,'');
   },
@@ -3274,6 +3284,24 @@ const AI = {
     ].filter(Boolean).join('\n');
   },
 
+  /* The shape of the trip, and nothing else. Deliberately tiny: this is the
+     one request that has to cover every date, so it must stay fast. */
+  outlinePrompt(trip, extra){
+    return [
+      this.tripContext(trip),
+      extra ? '\nEXTRA INSTRUCTIONS FROM THE TRAVELLER (highest priority):\n' + extra : '',
+      '',
+      'Plan the SHAPE of the trip only. No activities, no times, no restaurants, no detail.',
+      'For each date give a short title, a theme, and the ONE neighbourhood or area that day is based around.',
+      'Group nearby things onto the same day so the trip does not criss-cross the map, and give it an arc:',
+      'gentle on the arrival day, the ambitious things in the middle, something light before departure.',
+      '',
+      'Return ONLY this JSON object:',
+      '{"tripTitle":"string","days":[{"date":"YYYY-MM-DD","title":"string","theme":"string","area":"string"}]}',
+      'Include every date listed above, in order, and nothing else.'
+    ].filter(Boolean).join('\n');
+  },
+
   dayPrompt(trip, day, extra){
     const i = trip.days.findIndex(d=>d.id===day.id);
     const near = trip.days.filter((_,j)=>Math.abs(j-i)<=2 && j!==i)
@@ -3402,6 +3430,9 @@ const AI = {
       if(res.status === 426) throw new Error('STALE_BUILD: ' + msg);
       if(status === 'DAILY_CAP') throw new Error('DAILY_CAP: ' + msg);
       if(status === 'NO_SERVER_KEY') throw new Error('NO_SERVER_KEY: ' + msg);
+      /* The server has already worked out what Google's refusal means and
+         written the fix in plain words. Show that, not the HTTP code. */
+      if(status === 'GOOGLE_REFUSED') throw new Error(msg || ('Google refused the request (' + res.status + ').'));
       throw new Error('HTTP_'+res.status+(status?' '+status:'')+(msg?': '+msg:''));
     }
 
@@ -3456,7 +3487,16 @@ const AI = {
     if(m.startsWith('HTTP_403')) return 'Access denied (403). The key may be restricted, or the Generative Language API is not enabled for that project.';
     if(m.startsWith('HTTP_404')) return 'That model name does not exist for your key. Hit "Refresh model list" in Settings and pick one from the dropdown.';
     if(m.startsWith('HTTP_429')) return 'Free-tier quota hit (requests per minute or per day). Wait a minute, switch to a Flash-Lite model, or try again tomorrow.';
-    if(m.startsWith('HTTP_5')||m.startsWith('HTTP_502')) return 'Google returned a server error. Retry in a minute.';
+    /* A 500 from Wayfare's own function is not a Google outage, and saying so
+       sends people off waiting for something that will never clear. Our
+       function labels its own failures SERVER_ERROR; anything else at 5xx
+       really did come back from Google. */
+    if(/SERVER_ERROR/.test(m)) return 'Wayfare\'s own server hit an error: ' +
+      m.replace(/^HTTP_5\d\d\s*SERVER_ERROR:?\s*/,'') +
+      ' — this will not clear on its own. Netlify -> Logs -> Functions shows the full detail.';
+    if(m.startsWith('HTTP_5')) return 'Google returned a server error (' +
+      (m.match(/HTTP_(\d{3})/)||[,'5xx'])[1] + '). These are usually brief — retry in a minute. ' +
+      'If it keeps happening, try a different model in Settings. ' + m.replace(/^HTTP_\d{3}[^:]*:?\s*/,'');
     return m;
   },
 
@@ -3559,6 +3599,29 @@ const AI = {
     return {days:trip.days.length, filled};
   },
 
+  /* Lays down one empty day per date, carrying the outline's title and area so
+     each per-day request knows what it is meant to be. */
+  applyOutline(trip, plan){
+    const wanted = D.range(trip.flights.outDate, trip.flights.backDate||trip.flights.outDate);
+    const list = Array.isArray(plan.days) ? plan.days : [];
+    const byDate = {}; list.forEach(d=>{ if(d && d.date) byDate[String(d.date).slice(0,10)] = d; });
+    const old = trip.days || [];
+    trip.days = wanted.map((date, i) => {
+      const day = old.find(d=>d.date===date) || newDay(date);
+      const raw = byDate[date] || list[i] || null;
+      day.activities = [];
+      if(raw){
+        if(raw.title) day.title = String(raw.title).slice(0,120);
+        const s = [raw.theme, raw.area].filter(Boolean).join(' · ');
+        if(s) day.summary = s.slice(0,200);
+        day._outline = {theme: String(raw.theme||''), area: String(raw.area||'')};
+      }
+      return day;
+    });
+    if(plan.tripTitle && (!trip.name || /^untitled/i.test(trip.name))) trip.name = String(plan.tripTitle).slice(0,80);
+    return trip.days.length;
+  },
+
   applyDayPlan(trip, day, plan){
     const raw = Array.isArray(plan.days) ? plan.days[0] : (plan.day || (plan.activities ? plan : null));
     if(!raw) throw new Error('The response did not contain a day.');
@@ -3571,6 +3634,74 @@ const AI = {
 
 /* --------------------------- generation modal ---------------------------- */
 let _genAbort = null;
+
+/* Netlify stops a function at ten seconds. A whole itinerary in one request
+   routinely runs past that, and when it does the function is killed mid-reply
+   and the app sees a meaningless 5xx. So a trip is built in small pieces: one
+   quick outline, then one request per day. Every request finishes well inside
+   the limit, each day is saved as it lands, and one bad day no longer costs
+   you the whole plan. It also plans better — each day is written knowing what
+   the days around it already contain. */
+async function generateTripInChunks({trip, nudge, ui}){
+  const say  = (t)=>{ if(ui.status) ui.status.textContent = t; };
+  const note = (t)=>{ if(ui.daysP)  ui.daysP.textContent  = t; };
+  const seen = (t)=>{ if(ui.chars)  ui.chars.textContent  = String(t).length.toLocaleString()+' chars'; };
+  const peek = (t)=>{ if(ui.pre){ ui.pre.textContent = String(t).slice(-1400); ui.pre.scrollTop = ui.pre.scrollHeight; } };
+  const cancelled = ()=> _genAbort && _genAbort.signal.aborted;
+  const stop = ()=>{ const e = new Error('Cancelled'); e.name = 'AbortError'; return e; };
+
+  say('Sketching the shape of the trip…');
+  note('outline');
+  const outline = await AI.call({
+    prompt: AI.outlinePrompt(trip, nudge),
+    maxTokens: 2048,
+    signal: _genAbort.signal,
+    onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
+  });
+  AI.applyOutline(trip, AI.extractJSON(outline));
+
+  const days = trip.days.slice();
+  const failed = [];
+
+  for(let i = 0; i < days.length; i++){
+    if(cancelled()) throw stop();
+    const day = days[i];
+    const o = day._outline || {};
+    say('Day ' + (i+1) + ' of ' + days.length + (day.title ? ' — ' + day.title : ''));
+    note(i + ' of ' + days.length + ' done');
+
+    const guide = [
+      o.theme ? 'The agreed theme for this day: ' + o.theme : '',
+      o.area  ? 'Base this day around: ' + o.area : ''
+    ].filter(Boolean).join('\n');
+
+    try{
+      const text = await AI.call({
+        prompt: AI.dayPrompt(trip, day, [nudge, guide].filter(Boolean).join('\n')),
+        maxTokens: 8192,
+        signal: _genAbort.signal,
+        onDelta: (soFar)=>{ seen(soFar); peek(soFar); }
+      });
+      AI.applyDayPlan(trip, day, AI.extractJSON(text));
+      /* Saved as we go, so a failure halfway keeps everything before it.
+         Not for an unsaved draft, which should not appear in the trip list
+         until the person has actually finished creating it. */
+      if(!App.draft) await Repo.saveTrip(trip);
+    }catch(err){
+      if(err.name === 'AbortError') throw err;
+      console.warn('[Wayfare] day failed:', day.date, err && err.message);
+      failed.push(day.date);
+    }
+  }
+
+  (trip.days || []).forEach(d => { delete d._outline; });
+  note((days.length - failed.length) + ' of ' + days.length + ' days done');
+
+  if(failed.length === days.length) throw new Error('EMPTY: nothing came back for any day.');
+  if(failed.length) toast(failed.length + ' day' + (failed.length===1?'':'s') +
+    ' did not come back — open them and press Regenerate');
+  return {failed};
+}
 
 function openGenerateModal(opts){
   const scope = opts.scope;
@@ -3727,6 +3858,28 @@ async function runGeneration(scope, dayId, actId){
     const t0 = Date.now();
     const timer = setInterval(()=>{ elap.textContent = Math.round((Date.now()-t0)/1000)+'s'; }, 500);
     _genAbort = new AbortController();
+
+    /* A whole trip goes the chunked route; single days and single items are
+       already small enough to ask for in one go. */
+    if(scope === 'trip'){
+      try{
+        await generateTripInChunks({trip, nudge, ui:{status, pre, chars, daysP}});
+      }catch(err){
+        clearInterval(timer); btn.disabled=false; btn.textContent='✨ Generate';
+        if(err.name==='AbortError'){ status.textContent='Cancelled.'; return; }
+        console.error(err);
+        return showErr(esc(AI.friendlyError(err)) +
+          '<div style="margin-top:8px"><button class="btn xs" data-gentab-jump="paste">Switch to copy-paste →</button></div>');
+      }
+      clearInterval(timer); btn.disabled=false; btn.textContent='✨ Generate';
+      const filled = trip.days.filter(d=>d.activities.length).length;
+      logAction(trip,'gemini-plan', filled + '/' + trip.days.length + ' days');
+      if(App.draft){ await finishDraftAfterAI(); }
+      else { await App.save(); Modal.close(); App.go('calendar'); }
+      toast('Gemini drafted ' + filled + ' days — edit anything', 'good');
+      return;
+    }
+
     try{
       text = await AI.call({
         prompt: scope==='trip' ? AI.tripPrompt(trip, nudge)
@@ -4586,7 +4739,10 @@ const Cloud = {
   async push(trip){
     if(!this.on(trip)) return;
     const now = this.snapshot(trip);
-    const was = trip._sig || {};
+    /* Assign back, don't just default locally: the loop below writes into
+       trip._sig, and a trip restored from storage without one would throw. */
+    trip._sig = trip._sig || {};
+    const was = trip._sig;
     trip._ver = trip._ver || {trip: 0, days: {}};
     const changedDays = (trip.days || []).filter(d => now[d.id] !== was[d.id]);
     const metaChanged = now.__meta !== was.__meta;
@@ -4680,9 +4836,25 @@ const Cloud = {
     }
 
     if((body.tripVersion || 0) > (trip._ver.trip || 0)){
-      ['name','destination','flights','constraints','travelers'].forEach(k => {
+      ['name','destination','flights','constraints'].forEach(k => {
         if(body.trip[k] !== undefined) trip[k] = body.trip[k];
       });
+      /* Travellers need merging rather than replacing. The server never sees
+         password material — it strips it on the way in — so a straight
+         overwrite here would quietly wipe everyone's profile password the
+         first time somebody else edited the trip details. */
+      if(Array.isArray(body.trip.travelers)){
+        const mineById = {};
+        (trip.travelers || []).forEach(v => { mineById[v.id] = v; });
+        trip.travelers = body.trip.travelers.map(v => {
+          const local = mineById[v.id];
+          if(!local) return v;
+          const merged = Object.assign({}, v);
+          if(local.passHash) merged.passHash = local.passHash;
+          if(local.salt)     merged.salt     = local.salt;
+          return merged;
+        });
+      }
       trip._ver.trip = body.tripVersion;
       changed++;
     }
@@ -4765,7 +4937,7 @@ function sharedBanner(){
       <button class="btn xs" data-act="sync-now">↻ Sync now</button>
       <button class="btn xs" data-act="invite">Invite</button>
     </div>
-  </div>`;
+  </div></div>`;
 }
 
 /* ------------------------------------------------------------- conflict --- */
